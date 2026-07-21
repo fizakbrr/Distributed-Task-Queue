@@ -14,6 +14,8 @@ class Job:
     # the same key produce the side effect once. Defaults to the job id in
     # __post_init__, which still dedupes redeliveries of this same job.
     idempotency_key: str = ""
+    attempts: int = 0
+    max_retries: int = 3
 
     def __post_init__(self):
         if not self.idempotency_key:

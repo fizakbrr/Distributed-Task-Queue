@@ -26,11 +26,17 @@ class Worker:
             requeued = self.broker.reap_dead_workers(self.id)
             if requeued:
                 print(f"[{self.id}] reaped {requeued} job(s) from dead worker(s)")
+            self.broker.promote_due()
             job = self.broker.claim(self.id)
             if job is None:
                 continue
-            self.execute(job)
-            self.broker.ack(self.id, job)
+            try:
+                self.execute(job)
+            except Exception as exc:
+                outcome = self.broker.reschedule(self.id, job)
+                print(f"[{self.id}] {job.task} id={job.id[:8]} failed ({exc!r}) -> {outcome}")
+            else:
+                self.broker.ack(self.id, job)
 
     def execute(self, job) -> None:
         if self.broker.is_done(job.idempotency_key):

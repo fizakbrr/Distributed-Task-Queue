@@ -19,3 +19,15 @@ def send_email(to, subject):
 @task
 def add(a, b):
     print(f"[add] {a} + {b} = {a + b}")
+
+
+@task
+def flaky(key, fail_times=2):
+    """Fails the first `fail_times` calls for this key, then succeeds.
+    Uses a Redis counter so the count survives across worker processes."""
+    import redis
+
+    n = redis.Redis(decode_responses=True).incr(f"demo:flaky:{key}")
+    if n <= fail_times:
+        raise RuntimeError(f"simulated failure #{n}")
+    print(f"[flaky] {key} succeeded on call #{n}")
