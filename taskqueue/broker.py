@@ -4,6 +4,8 @@ from .job import Job
 
 QUEUE = "tq:queue"
 PROCESSING = "tq:processing:{}"  # one in-flight list per worker
+DONE = "tq:done:{}"              # completion marker per idempotency key
+DONE_TTL = 24 * 3600             # dedupe window; also caps key growth
 
 
 class Broker:
@@ -25,3 +27,10 @@ class Broker:
         # Success: drop the job from the processing list. Until this runs,
         # a crash leaves the job parked where recovery can find it.
         self.r.lrem(PROCESSING.format(worker_id), 1, job.dumps())
+
+    def is_done(self, key: str) -> bool:
+        return self.r.exists(DONE.format(key)) == 1
+
+    def mark_done(self, key: str) -> None:
+        # NX: first completion wins; a concurrent duplicate cannot clobber it.
+        self.r.set(DONE.format(key), 1, nx=True, ex=DONE_TTL)
