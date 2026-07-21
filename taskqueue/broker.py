@@ -35,6 +35,9 @@ class Broker:
     def enqueue(self, job: Job) -> None:
         self.r.lpush(QUEUE, job.dumps())
 
+    def queue_depth(self) -> int:
+        return self.r.llen(QUEUE)
+
     def claim(self, worker_id: str, timeout: int = CLAIM_TIMEOUT) -> Job | None:
         # Atomic pop-and-park: the job moves from pending to this worker's
         # processing list in one Redis op, so it is never in zero places.
