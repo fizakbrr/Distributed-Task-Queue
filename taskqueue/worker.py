@@ -12,10 +12,11 @@ class Worker:
     def run(self) -> None:
         print(f"[{self.id}] started, waiting for jobs")
         while True:
-            job = self.broker.pop()
+            job = self.broker.claim(self.id)
             if job is None:
                 continue
             self.execute(job)
+            self.broker.ack(self.id, job)
 
     def execute(self, job) -> None:
         print(f"[{self.id}] executing {job.task}({', '.join(map(repr, job.args))}) id={job.id[:8]}")
