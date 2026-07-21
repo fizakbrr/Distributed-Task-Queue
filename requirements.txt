@@ -1,0 +1,2 @@
+redis>=5.0
+pytest>=8.0
