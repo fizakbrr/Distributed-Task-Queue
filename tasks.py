@@ -22,6 +22,17 @@ def add(a, b):
 
 
 @task
+def record(key):
+    """Demo task whose side effect is countable: appends its key to a Redis
+    list, so the crash demo can prove every job ran exactly once."""
+    import redis
+
+    time.sleep(0.3)
+    redis.Redis(decode_responses=True).rpush("demo:executions", key)
+    print(f"[record] executed {key}")
+
+
+@task
 def flaky(key, fail_times=2):
     """Fails the first `fail_times` calls for this key, then succeeds.
     Uses a Redis counter so the count survives across worker processes."""

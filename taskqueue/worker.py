@@ -6,10 +6,12 @@ from .broker import HEARTBEAT_INTERVAL, Broker
 
 
 class Worker:
-    def __init__(self, broker: Broker, tasks: dict):
+    def __init__(self, broker: Broker, tasks: dict, crash_after: int = 0):
         self.broker = broker
         self.tasks = tasks
         self.id = f"worker-{os.getpid()}"
+        self.crash_after = crash_after  # crash while holding the Nth claimed job
+        self.claimed = 0
 
     def _heartbeat_loop(self) -> None:
         # Daemon thread: keeps beating even while a long task blocks the main
@@ -30,6 +32,13 @@ class Worker:
             job = self.broker.claim(self.id)
             if job is None:
                 continue
+            self.claimed += 1
+            if self.crash_after and self.claimed >= self.crash_after:
+                # os._exit skips finally blocks, atexit hooks, flushes:
+                # the closest Python gets to kill -9. The claimed job is
+                # left parked in our processing list for the reaper.
+                print(f"[{self.id}] CRASHING with {job.task} id={job.id[:8]} in flight")
+                os._exit(1)
             try:
                 self.execute(job)
             except Exception as exc:
