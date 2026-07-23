@@ -1,16 +1,16 @@
 # Distributed Task Queue
 
-A distributed task queue built from scratch in Python on top of Redis (a mini Celery), written to understand the distributed systems problems such a queue has to solve, not just to have one. Each reliability feature was added as its own commit, so `git log` reads as a build narrative: every layer names the failure mode it closes.
+I built this to actually understand the distributed systems problems a task queue has to solve, not just to end up with one that works. It's a mini Celery, written from scratch in Python on top of Redis. Every reliability feature landed as its own commit, so `git log` doubles as a build log: each layer names the failure mode it closes.
 
-What it provides:
+What it does:
 
-- Multiple worker processes pulling jobs from a Redis-backed queue
-- At-least-once delivery: a worker crash never loses a claimed job
-- Idempotency keys, so redelivered jobs do not repeat side effects
-- Heartbeat-based failure detection: a crashed worker's in-flight jobs are requeued by its peers
+- Runs multiple worker processes pulling jobs off a Redis queue
+- Guarantees at-least-once delivery: a worker crash never loses a claimed job
+- Uses idempotency keys so a retried job doesn't repeat its side effect
+- Detects failure through heartbeats: a crashed worker's in-flight jobs get picked up by whoever's still alive
 - Retries with full-jitter exponential backoff, ending in a dead-letter queue
-- Backpressure: a bounded queue that pushes overload back to producers
-- A crash-simulation flag and a demo that proves the recovery logic end to end
+- Applies backpressure: the queue has a max depth, so a slow consumer pushes back on producers instead of Redis running out of memory
+- Ships a crash-simulation flag and a demo that actually proves the recovery works
 
 ## Layout
 
@@ -59,42 +59,42 @@ python run_worker.py --crash-after 3             # a worker that dies mid-job
 python -m pytest                                 # tests (use Redis db 15)
 ```
 
-`demo.py` enqueues 10 jobs, starts one worker that hard-crashes (`os._exit`) while holding a claimed job and one healthy worker, then asserts every job completed exactly once. Watch for the `reaped 1 job(s) from dead worker(s)` line: that is the recovery happening.
+`demo.py` enqueues 10 jobs, starts one worker that hard-crashes (`os._exit`) while holding a claimed job, and one healthy worker, then checks that every job completed exactly once. Watch for the `reaped 1 job(s) from dead worker(s)` line, that's the recovery actually happening.
 
-## Design deep-dive: worker crash recovery
+## The hard part: recovering from a worker crash
 
-This is the hardest part of the design, because it stacks three mechanisms that are each individually wrong and only correct together.
+This was the piece that took the most thought, because it's three mechanisms that are each broken on their own and only correct once stacked together.
 
-### The problem
+### Why the naive version breaks
 
-A naive queue (`BRPOP`, then execute) loses a job the moment a worker crashes after popping: the job exists nowhere. That is at-most-once delivery, and it fails silently, which is the worst way to fail.
+A naive queue (`BRPOP`, then execute) loses a job the moment a worker crashes after popping it: the job exists nowhere. That's at-most-once delivery, and it fails silently, which is about the worst way a queue can fail.
 
-### Step 1: never let a job be in zero places
+### Fix 1: never let a job sit in zero places
 
-`claim()` uses `BLMOVE` to atomically move a job from `tq:queue` into the claiming worker's own `tq:processing:<id>` list. One Redis command, so there is no window where the job is in transit. The worker acks (`LREM` from the processing list) only after the task succeeds. A crash at any point before the ack leaves the job parked in the processing list, recoverable evidence instead of silent loss. This flips the guarantee from at-most-once to at-least-once.
+`claim()` uses `BLMOVE` to atomically move a job from `tq:queue` into the claiming worker's own `tq:processing:<id>` list. One Redis command, so there's no window where the job is in transit. The worker acks (`LREM` from the processing list) only after the task succeeds. A crash at any point before the ack leaves the job parked in the processing list, recoverable evidence instead of silent loss. That's the flip from at-most-once to at-least-once.
 
-### Step 2: detect the corpse
+### Fix 2: detect the corpse
 
-Parked jobs help only if someone notices the owner died. Each worker maintains a heartbeat key with a short TTL, refreshed by a daemon thread at one third of the TTL. The key insight is that a heartbeat is a lease: it expires by itself, requiring zero cooperation from the dead. A crashed process, a kernel panic, and a yanked cable all present identically, which is the only failure signal that is actually reliable.
+Parked jobs only help if someone notices the owner died. Each worker keeps a heartbeat key alive with a short TTL, refreshed by a daemon thread at a third of that TTL. The heartbeat is a lease: it expires on its own, so it needs zero cooperation from whatever just died. A crashed process, a kernel panic, and a yanked cable all look identical from the outside, which happens to be the only signal you can actually trust.
 
-Every worker also acts as a reaper: it scans `tq:workers` for ids whose heartbeat key is gone and moves their parked jobs back onto the main queue with `LMOVE`. Concurrent reapers are safe without locks because each `LMOVE` is atomic: two reapers racing over the same corpse move different jobs, never the same job twice. Peer reaping was chosen over a dedicated monitor process because the monitor is itself a single point of failure.
+Every worker also acts as a reaper: it scans `tq:workers` for ids whose heartbeat key has expired and moves their parked jobs back onto the main queue with `LMOVE`. Concurrent reapers don't need a lock, because each `LMOVE` is atomic, so two reapers racing over the same corpse move different jobs, never the same one twice. I went with peer reaping instead of a dedicated monitor process, since the monitor would just become its own single point of failure.
 
-The TTL is a genuine tradeoff, not a constant to hide. In an asynchronous system you cannot distinguish a crashed worker from a slow one (a 30-second GC pause looks exactly like death). A short TTL recovers fast but produces false positives; a long one is safe but slow. This design deliberately tolerates false positives, because of step 3.
+The TTL itself is a real tradeoff, not a constant to hide behind. In an asynchronous system you genuinely cannot tell a crashed worker from a slow one (a 30-second GC pause looks exactly like death from the outside). A short TTL recovers fast but throws false positives; a long one is safer but slower. This design tolerates false positives on purpose, because of the third piece below.
 
-### Step 3: make being wrong cheap
+### Fix 3: make being wrong cheap
 
-A false positive means the "dead" worker is still running its task while a peer re-runs it. Redelivery duplicates are also inherent to at-least-once itself: if a worker finishes a task and dies just before the ack, the job comes back. Exactly-once delivery is impossible (the ack travels over the same unreliable network as everything else, the Two Generals problem), so the achievable target is exactly-once effect.
+A false positive means the "dead" worker is still running its task while someone else re-runs it. Duplicates also happen for a separate reason baked into at-least-once itself: if a worker finishes the task and dies right before the ack, the job comes back anyway. Exactly-once delivery isn't actually achievable here (the ack has to travel over the same unreliable network as everything else, the old Two Generals problem), so the realistic target is exactly-once effect, not exactly-once delivery.
 
-Idempotency keys provide it: the producer names the business operation (`order-1234-email`), the worker records completion under that name (`SET NX` with TTL) and skips any future delivery carrying it. The ordering in the worker is deliberate: `mark_done` before `ack`. Walk the crash windows and the worst remaining case is a crash after the side effect but before `mark_done`, a few microseconds wide. Closing it entirely would require the side effect and the marker to commit atomically (a transactional outbox), which is out of scope and worth knowing by name.
+Idempotency keys get you there: the producer names the operation (`order-1234-email`), the worker records that it finished under that name (`SET NX` with a TTL), and skips any later delivery carrying the same key. The order matters here too: `mark_done` runs before `ack`. Walking through the crash windows, the one case still left open is a crash after the side effect runs but before `mark_done` writes, a window a few microseconds wide. Closing that fully would mean the side effect and the marker commit as one atomic unit (a transactional outbox), which felt like its own project and out of scope here.
 
-The three steps interlock: claim/ack makes crashes recoverable, heartbeats make them detectable, and idempotency makes the inevitable false positives and redeliveries harmless. Failure detection is allowed to be sloppy precisely because being wrong is cheap.
+Put together: claim/ack makes a crash recoverable, heartbeats make it detectable, and idempotency makes the false positives and redeliveries harmless. Failure detection gets to be sloppy specifically because being wrong doesn't cost anything.
 
 ### Known limits, honestly
 
-- Dedup markers expire after 24h: a duplicate arriving later re-executes. Every real system has such a window (Stripe's idempotency keys included).
-- The backpressure bound is check-then-push, so it is approximate under concurrent producers: it caps growth rather than enforcing an exact limit.
-- Job payloads are JSON, and the ack matches by exact serialized string: fine here, but a schema change mid-flight would strand jobs.
-- One lesson from building it: redis-py 8 defaults `socket_timeout` to 5s, identical to the `BLMOVE` server-side block, which made "empty queue" indistinguishable from "dead connection" and stalled workers in silent reconnect loops. Client timeouts must always exceed server-side blocking timeouts.
+- Dedup markers expire after 24 hours, so a duplicate that shows up later still re-executes. Every real system I've seen has a window like this somewhere (Stripe's idempotency keys included).
+- The backpressure check is check-then-push, so under concurrent producers it's approximate: it caps growth, it doesn't enforce an exact limit.
+- Job payloads are JSON, and the ack matches on the exact serialized string. Fine for this project, but a schema change mid-flight would strand jobs.
+- One lesson from building it: redis-py 8 defaults `socket_timeout` to 5 seconds, exactly the same as the `BLMOVE` server-side block. That made an empty queue indistinguishable from a dead connection and left workers stuck in silent reconnect loops. Client-side timeouts need to be longer than whatever server-side blocking timeout they wrap.
 
 ## License
 
